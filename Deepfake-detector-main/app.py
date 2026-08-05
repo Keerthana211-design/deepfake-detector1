@@ -1,0 +1,1180 @@
+"""
+Deepfake Image & Audio Detection — Multi-Agent AI System (Streamlit)
+======================================================================
+Stack: LangGraph (multi-agent orchestration) + Hugging Face Transformers
+       (detection models) + Groq / LangChain (explanation LLM) + Streamlit (UI)
+
+Run locally:
+    pip install -r requirements.txt
+    export GROQ_API_KEY="your-key-here"   # optional — see note below
+    streamlit run app.py
+
+Deploy on Streamlit Community Cloud:
+    Push this repo, point the app at app.py, and add GROQ_API_KEY under
+    "Secrets" in the app settings (Settings -> Secrets):
+        GROQ_API_KEY = "your-key-here"
+    The app also works with no key at all — it falls back to a
+    template-based explanation instead of the LLM.
+
+Models used (verified live on the Hugging Face Hub, Aug 2026):
+  Image : prithivMLmods/Deep-Fake-Detector-v2-Model   (ViT, "Realism"/"Deepfake")
+          fallback -> Wvolf/ViT_Deepfake_Detection
+  Audio : MelodyMachine/Deepfake-audio-detection-V2    (Wav2Vec2-based)
+          fallback -> mo-thecreator/Deepfake-audio-detection
+  LLM   : openai/gpt-oss-20b on Groq (llama-3.1-8b-instant was deprecated
+          by Groq in June 2026 — gpt-oss-20b is its recommended replacement)
+"""
+
+import os
+import io
+import gc
+import uuid
+import tempfile
+import traceback
+from datetime import datetime
+from typing import TypedDict, Optional, Literal, Any, Dict
+
+import numpy as np
+import torch
+from PIL import Image
+import cv2
+
+import librosa
+import soundfile as sf  # noqa: F401  (kept for explicit wav I/O support)
+from pydub import AudioSegment
+
+from transformers import pipeline
+
+from langgraph.graph import StateGraph, END
+from langchain_groq import ChatGroq
+from langchain_core.messages import HumanMessage, SystemMessage
+
+from fpdf import FPDF
+import streamlit as st
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
+
+
+class Config:
+    IMAGE_MODEL_ID = "prithivMLmods/Deep-Fake-Detector-v2-Model"
+    IMAGE_MODEL_FALLBACK = "Wvolf/ViT_Deepfake_Detection"
+
+    AUDIO_MODEL_ID = "MelodyMachine/Deepfake-audio-detection-V2"
+    AUDIO_MODEL_FALLBACK = "mo-thecreator/Deepfake-audio-detection"
+
+    # llama-3.1-8b-instant was deprecated by Groq (June 2026).
+    # openai/gpt-oss-20b is Groq's recommended replacement; llama-3.3-70b-versatile
+    # is kept as a secondary fallback in case gpt-oss-20b is unavailable on your account.
+    GROQ_MODEL = "openai/gpt-oss-20b"
+    GROQ_MODEL_FALLBACK = "llama-3.3-70b-versatile"
+
+    IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
+
+    AUDIO_SAMPLE_RATE = 16000
+    AUDIO_MAX_SECONDS = 10
+    IMAGE_TARGET_SIZE = (224, 224)
+
+    REPORT_DIR = os.environ.get("REPORT_DIR", tempfile.gettempdir())
+
+
+os.makedirs(Config.REPORT_DIR, exist_ok=True)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# =========================================================
+# UTILITY FUNCTIONS
+# =========================================================
+
+
+def get_file_extension(filepath: str) -> str:
+    return os.path.splitext(filepath)[1].lower()
+
+
+def safe_load_image(filepath: str) -> Optional[Image.Image]:
+    try:
+        img = Image.open(filepath)
+        img.verify()
+        img = Image.open(filepath).convert("RGB")
+        return img
+    except Exception as e:
+        print(f"[image loader] failed: {e}")
+        return None
+
+
+def safe_load_audio(filepath: str, sr: int = Config.AUDIO_SAMPLE_RATE):
+    try:
+        ext = get_file_extension(filepath)
+        if ext in {".mp3", ".m4a", ".ogg"}:
+            audio = AudioSegment.from_file(filepath)
+            audio = audio.set_channels(1).set_frame_rate(sr)
+            buf = io.BytesIO()
+            audio.export(buf, format="wav")
+            buf.seek(0)
+            y, _ = librosa.load(buf, sr=sr, mono=True)
+        else:
+            y, _ = librosa.load(filepath, sr=sr, mono=True)
+        if y is None or len(y) == 0:
+            raise ValueError("Decoded audio is empty.")
+        return y
+    except Exception as e:
+        print(f"[audio loader] failed: {e}")
+        return None
+
+
+def timestamp_now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def format_confidence(score: float) -> str:
+    return f"{score * 100:.2f}%"
+
+
+def normalize_label(label: str) -> str:
+    l = label.strip().lower()
+    fake_keywords = ["fake", "spoof", "deepfake", "synthetic", "generated", "ai"]
+    real_keywords = ["real", "bonafide", "genuine", "authentic", "human"]
+    if any(k in l for k in fake_keywords):
+        return "DEEPFAKE"
+    if any(k in l for k in real_keywords):
+        return "REAL"
+    return "UNKNOWN"
+
+
+# =========================================================
+# LANGGRAPH STATE
+# =========================================================
+
+
+class DeepfakeState(TypedDict, total=False):
+    filepath: str
+    file_name: str
+    is_valid: bool
+    validation_message: str
+    media_type: Literal["image", "audio", "unknown"]
+    prediction: Literal["REAL", "DEEPFAKE", "UNKNOWN"]
+    raw_scores: Dict[str, float]
+    confidence: float
+    confidence_label: str
+    explanation: str
+    recommendation: str
+    report_paths: Dict[str, str]
+    error: Optional[str]
+    status: str
+
+
+# =========================================================
+# MODEL LOADING (cached across Streamlit reruns, with fallback)
+# =========================================================
+
+
+@st.cache_resource(show_spinner="Loading image deepfake model...")
+def load_image_model():
+    for model_id in (Config.IMAGE_MODEL_ID, Config.IMAGE_MODEL_FALLBACK):
+        try:
+            print(f"[model] loading image model: {model_id}")
+            clf = pipeline("image-classification", model=model_id, device=0 if DEVICE == "cuda" else -1)
+            print(f"[model] loaded: {model_id} (device={DEVICE})")
+            return clf
+        except Exception as e:
+            print(f"[model] failed to load '{model_id}': {e}")
+    return None
+
+
+@st.cache_resource(show_spinner="Loading audio deepfake model...")
+def load_audio_model():
+    for model_id in (Config.AUDIO_MODEL_ID, Config.AUDIO_MODEL_FALLBACK):
+        try:
+            print(f"[model] loading audio model: {model_id}")
+            clf = pipeline("audio-classification", model=model_id, device=0 if DEVICE == "cuda" else -1)
+            print(f"[model] loaded: {model_id} (device={DEVICE})")
+            return clf
+        except Exception as e:
+            print(f"[model] failed to load '{model_id}': {e}")
+    return None
+
+
+# =========================================================
+# AGENT NODES
+# =========================================================
+
+
+def supervisor_agent(state: DeepfakeState) -> DeepfakeState:
+    print("=" * 60)
+    print(f"[Supervisor] starting analysis for: {state.get('file_name', 'unknown')}")
+    state["status"] = "started"
+    state["error"] = None
+    return state
+
+
+def input_validation_agent(state: DeepfakeState) -> DeepfakeState:
+    filepath = state.get("filepath")
+    if not filepath or not os.path.exists(filepath):
+        state["is_valid"] = False
+        state["validation_message"] = "File not found or path is invalid."
+        state["error"] = state["validation_message"]
+        return state
+
+    ext = get_file_extension(filepath)
+    if ext not in Config.IMAGE_EXTENSIONS and ext not in Config.AUDIO_EXTENSIONS:
+        state["is_valid"] = False
+        state["validation_message"] = (
+            f"Unsupported file type '{ext}'. Supported: "
+            f"{sorted(Config.IMAGE_EXTENSIONS | Config.AUDIO_EXTENSIONS)}"
+        )
+        state["error"] = state["validation_message"]
+        return state
+
+    if os.path.getsize(filepath) == 0:
+        state["is_valid"] = False
+        state["validation_message"] = "File is empty (0 bytes) — possibly corrupted upload."
+        state["error"] = state["validation_message"]
+        return state
+
+    state["is_valid"] = True
+    state["validation_message"] = "File passed validation."
+    return state
+
+
+def media_detection_agent(state: DeepfakeState) -> DeepfakeState:
+    if not state.get("is_valid"):
+        state["media_type"] = "unknown"
+        return state
+    ext = get_file_extension(state["filepath"])
+    if ext in Config.IMAGE_EXTENSIONS:
+        state["media_type"] = "image"
+    elif ext in Config.AUDIO_EXTENSIONS:
+        state["media_type"] = "audio"
+    else:
+        state["media_type"] = "unknown"
+    return state
+
+
+def image_detection_agent(state: DeepfakeState) -> DeepfakeState:
+    if state.get("media_type") != "image":
+        return state
+    try:
+        img = safe_load_image(state["filepath"])
+        if img is None:
+            state["error"] = "Could not decode the uploaded image (possibly corrupted)."
+            state["prediction"] = "UNKNOWN"
+            state["raw_scores"] = {}
+            return state
+
+        cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        cv2.resize(cv_img, Config.IMAGE_TARGET_SIZE)
+
+        clf = load_image_model()
+        if clf is None:
+            state["error"] = "Image deepfake model failed to load (check internet connection)."
+            state["prediction"] = "UNKNOWN"
+            state["raw_scores"] = {}
+            return state
+
+        results = clf(img)
+        raw_scores = {r["label"]: float(r["score"]) for r in results}
+        top = results[0]
+        prediction = normalize_label(top["label"])
+        state["prediction"] = prediction if prediction != "UNKNOWN" else "REAL"
+        state["raw_scores"] = raw_scores
+        state["confidence"] = float(top["score"])
+    except Exception as e:
+        traceback.print_exc()
+        state["error"] = f"Image detection failed: {e}"
+        state["prediction"] = "UNKNOWN"
+        state["raw_scores"] = {}
+    finally:
+        gc.collect()
+        if DEVICE == "cuda":
+            torch.cuda.empty_cache()
+    return state
+
+
+def audio_detection_agent(state: DeepfakeState) -> DeepfakeState:
+    if state.get("media_type") != "audio":
+        return state
+    try:
+        y = safe_load_audio(state["filepath"], sr=Config.AUDIO_SAMPLE_RATE)
+        if y is None:
+            state["error"] = "Could not decode the uploaded audio (possibly corrupted)."
+            state["prediction"] = "UNKNOWN"
+            state["raw_scores"] = {}
+            return state
+
+        y_trimmed, _ = librosa.effects.trim(y, top_db=25)
+        if len(y_trimmed) == 0:
+            y_trimmed = y
+        max_len = Config.AUDIO_SAMPLE_RATE * Config.AUDIO_MAX_SECONDS
+        if len(y_trimmed) > max_len:
+            y_trimmed = y_trimmed[:max_len]
+
+        clf = load_audio_model()
+        if clf is None:
+            state["error"] = "Audio deepfake model failed to load (check internet connection)."
+            state["prediction"] = "UNKNOWN"
+            state["raw_scores"] = {}
+            return state
+
+        results = clf({"array": y_trimmed, "sampling_rate": Config.AUDIO_SAMPLE_RATE})
+        raw_scores = {r["label"]: float(r["score"]) for r in results}
+        top = results[0]
+        prediction = normalize_label(top["label"])
+        state["prediction"] = prediction if prediction != "UNKNOWN" else "REAL"
+        state["raw_scores"] = raw_scores
+        state["confidence"] = float(top["score"])
+    except Exception as e:
+        traceback.print_exc()
+        state["error"] = f"Audio detection failed: {e}"
+        state["prediction"] = "UNKNOWN"
+        state["raw_scores"] = {}
+    finally:
+        gc.collect()
+        if DEVICE == "cuda":
+            torch.cuda.empty_cache()
+    return state
+
+
+def confidence_agent(state: DeepfakeState) -> DeepfakeState:
+    confidence = state.get("confidence", 0.0) or 0.0
+    if confidence >= 0.85:
+        label = "Very High"
+    elif confidence >= 0.65:
+        label = "High"
+    elif confidence >= 0.5:
+        label = "Moderate"
+    else:
+        label = "Low"
+    state["confidence_label"] = label
+    return state
+
+
+def _template_explanation(state: DeepfakeState) -> str:
+    media = state.get("media_type", "file")
+    pred = state.get("prediction", "UNKNOWN")
+    conf = format_confidence(state.get("confidence", 0.0) or 0.0)
+    scores = state.get("raw_scores", {})
+    scores_str = ", ".join(f"{k}: {format_confidence(v)}" for k, v in scores.items()) or "n/a"
+
+    if pred == "DEEPFAKE":
+        return (
+            f"The {media} was classified as a likely DEEPFAKE with {conf} confidence. "
+            f"The model detected statistical patterns commonly associated with AI-generated "
+            f"or manipulated media. Raw model scores: {scores_str}."
+        )
+    elif pred == "REAL":
+        return (
+            f"The {media} was classified as likely REAL/authentic with {conf} confidence. "
+            f"No strong indicators of AI generation or manipulation were detected. "
+            f"Raw model scores: {scores_str}."
+        )
+    return f"The system could not reach a confident conclusion about this {media}. Raw model scores: {scores_str}."
+
+
+def explanation_agent(state: DeepfakeState) -> DeepfakeState:
+    if state.get("error") and not state.get("prediction"):
+        state["explanation"] = f"Analysis could not be completed: {state['error']}"
+        return state
+
+    groq_key = os.environ.get("GROQ_API_KEY", "")
+    if not groq_key:
+        state["explanation"] = _template_explanation(state)
+        return state
+
+    system_prompt = (
+        "You are a digital forensics assistant explaining deepfake detection results to a "
+        "non-technical end user. Be concise (3-4 sentences), clear, and avoid jargon where "
+        "possible. Never claim certainty — describe results as model predictions."
+    )
+    user_prompt = (
+        f"Media type: {state.get('media_type')}\n"
+        f"Prediction: {state.get('prediction')}\n"
+        f"Confidence: {format_confidence(state.get('confidence', 0.0) or 0.0)}\n"
+        f"Raw model scores: {state.get('raw_scores')}\n\n"
+        "Explain this result to the user in plain language."
+    )
+
+    for model_name in (Config.GROQ_MODEL, Config.GROQ_MODEL_FALLBACK):
+        try:
+            llm = ChatGroq(model=model_name, api_key=groq_key, temperature=0.3, max_tokens=250)
+            response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
+            state["explanation"] = response.content.strip()
+            return state
+        except Exception as e:
+            print(f"[Explanation Agent] Groq model '{model_name}' failed: {e}")
+            continue
+
+    state["explanation"] = _template_explanation(state)
+    return state
+
+
+def recommendation_agent(state: DeepfakeState) -> DeepfakeState:
+    pred = state.get("prediction", "UNKNOWN")
+    conf_label = state.get("confidence_label", "Low")
+
+    if pred == "DEEPFAKE" and conf_label in ("High", "Very High"):
+        rec = (
+            "High likelihood of manipulation detected. Do not trust or share this media without "
+            "independent verification. Consider reverse image/audio search, metadata inspection, "
+            "and consultation with a digital forensics expert before acting on it."
+        )
+    elif pred == "DEEPFAKE":
+        rec = (
+            "Possible manipulation detected, but confidence is not high. Treat with caution and "
+            "seek a second opinion or additional forensic tools before drawing conclusions."
+        )
+    elif pred == "REAL" and conf_label in ("High", "Very High"):
+        rec = (
+            "No strong signs of manipulation detected. The media appears authentic, but automated "
+            "detectors are not infallible — apply normal source-verification practices for sensitive content."
+        )
+    elif pred == "REAL":
+        rec = (
+            "The media appears likely authentic, but confidence is moderate/low. If this content is "
+            "high-stakes (legal, financial, identity-related), corroborate with additional evidence."
+        )
+    else:
+        rec = "The system could not confidently classify this media. Try a clearer/uncorrupted file."
+
+    state["recommendation"] = rec
+    return state
+
+
+def _build_report_dict(state: DeepfakeState) -> Dict[str, str]:
+    return {
+        "File Name": state.get("file_name", "N/A"),
+        "Media Type": str(state.get("media_type", "N/A")).upper(),
+        "Prediction": state.get("prediction", "N/A"),
+        "Confidence Score": format_confidence(state.get("confidence", 0.0) or 0.0),
+        "Confidence Label": state.get("confidence_label", "N/A"),
+        "Explanation": state.get("explanation", "N/A"),
+        "Recommendation": state.get("recommendation", "N/A"),
+        "Timestamp": timestamp_now(),
+    }
+
+
+def report_generator_agent(state: DeepfakeState) -> DeepfakeState:
+    report = _build_report_dict(state)
+    run_id = uuid.uuid4().hex[:8]
+    base_name = f"deepfake_report_{run_id}"
+    paths = {}
+
+    try:
+        txt_path = os.path.join(Config.REPORT_DIR, f"{base_name}.txt")
+        with open(txt_path, "w") as f:
+            f.write("DEEPFAKE DETECTION REPORT\n" + "=" * 40 + "\n")
+            for k, v in report.items():
+                f.write(f"{k}: {v}\n")
+        paths["txt"] = txt_path
+
+        md_path = os.path.join(Config.REPORT_DIR, f"{base_name}.md")
+        with open(md_path, "w") as f:
+            f.write("# Deepfake Detection Report\n\n")
+            for k, v in report.items():
+                f.write(f"**{k}:** {v}\n\n")
+        paths["md"] = md_path
+
+        pdf_path = os.path.join(Config.REPORT_DIR, f"{base_name}.pdf")
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Helvetica", "B", 16)
+        pdf.cell(0, 10, "Deepfake Detection Report", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 11)
+        pdf.ln(4)
+        for k, v in report.items():
+            pdf.set_font("Helvetica", "B", 11)
+            pdf.multi_cell(0, 7, f"{k}:")
+            pdf.set_font("Helvetica", "", 11)
+            pdf.multi_cell(0, 7, str(v))
+            pdf.ln(1)
+        pdf.output(pdf_path)
+        paths["pdf"] = pdf_path
+
+        state["report_paths"] = paths
+    except Exception as e:
+        state["error"] = f"Report generation failed: {e}"
+        state["report_paths"] = paths
+    return state
+
+
+# =========================================================
+# WORKFLOW (LangGraph assembly, cached — built once per session)
+# =========================================================
+
+
+def route_after_validation(state: DeepfakeState) -> str:
+    return "media_detection" if state.get("is_valid") else "report_generator"
+
+
+def route_by_media_type(state: DeepfakeState) -> str:
+    media_type = state.get("media_type")
+    if media_type == "image":
+        return "image_detection"
+    if media_type == "audio":
+        return "audio_detection"
+    return "confidence"
+
+
+@st.cache_resource(show_spinner=False)
+def build_workflow():
+    graph = StateGraph(DeepfakeState)
+
+    graph.add_node("supervisor", supervisor_agent)
+    graph.add_node("input_validation", input_validation_agent)
+    graph.add_node("media_detection", media_detection_agent)
+    graph.add_node("image_detection", image_detection_agent)
+    graph.add_node("audio_detection", audio_detection_agent)
+    graph.add_node("confidence", confidence_agent)
+    graph.add_node("explanation", explanation_agent)
+    graph.add_node("recommendation", recommendation_agent)
+    graph.add_node("report_generator", report_generator_agent)
+
+    graph.set_entry_point("supervisor")
+    graph.add_edge("supervisor", "input_validation")
+    graph.add_conditional_edges(
+        "input_validation",
+        route_after_validation,
+        {"media_detection": "media_detection", "report_generator": "report_generator"},
+    )
+    graph.add_conditional_edges(
+        "media_detection",
+        route_by_media_type,
+        {"image_detection": "image_detection", "audio_detection": "audio_detection", "confidence": "confidence"},
+    )
+    graph.add_edge("image_detection", "confidence")
+    graph.add_edge("audio_detection", "confidence")
+    graph.add_edge("confidence", "explanation")
+    graph.add_edge("explanation", "recommendation")
+    graph.add_edge("recommendation", "report_generator")
+    graph.add_edge("report_generator", END)
+
+    return graph.compile()
+
+
+def run_pipeline(filepath: str) -> DeepfakeState:
+    workflow = build_workflow()
+    initial_state: DeepfakeState = {
+        "filepath": filepath,
+        "file_name": os.path.basename(filepath) if filepath else "N/A",
+    }
+    return workflow.invoke(initial_state)
+
+
+def save_uploaded_file(uploaded_file) -> str:
+    """Persist a Streamlit UploadedFile to a real path on disk for the pipeline to read."""
+    ext = os.path.splitext(uploaded_file.name)[1]
+    tmp_path = os.path.join(tempfile.gettempdir(), f"upload_{uuid.uuid4().hex[:8]}{ext}")
+    with open(tmp_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    return tmp_path
+
+
+# =========================================================
+# REDESIGNED MODERN STREAMLIT DASHBOARD UI
+# =========================================================
+
+st.set_page_config(
+    page_title="Deepfake Shield AI — Multi-Agent Forensics",
+    page_icon="🛡️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# --- Load Custom Glassmorphism CSS ---
+def load_css():
+    # Resolve styles.css relative to this script, with fallback to cwd
+    _here = os.path.dirname(os.path.abspath(__file__)) if "__file__" in dir() else os.getcwd()
+    css_path = os.path.join(_here, "styles.css")
+    if not os.path.exists(css_path):
+        css_path = os.path.join(os.getcwd(), "styles.css")
+    if os.path.exists(css_path):
+        with open(css_path, "r", encoding="utf-8") as f:
+            st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
+
+load_css()
+
+# --- Groq API key resolution ---
+if "GROQ_API_KEY" not in os.environ or not os.environ["GROQ_API_KEY"]:
+    try:
+        secret_key = st.secrets.get("GROQ_API_KEY", "")
+    except Exception:
+        secret_key = ""
+    if secret_key:
+        os.environ["GROQ_API_KEY"] = secret_key
+
+# --- Session State Management ---
+if "active_page" not in st.session_state:
+    st.session_state.active_page = "Home"
+
+if "history" not in st.session_state:
+    st.session_state.history = []
+
+# --- Helper: Render Circular SVG Confidence Gauge ---
+def render_circular_gauge(confidence: float, prediction: str):
+    pct = max(0.0, min(100.0, confidence * 100.0))
+    stroke_class = "fake" if prediction == "DEEPFAKE" else ("real" if prediction == "REAL" else "unknown")
+    svg_html = f"""
+    <div class="circular-gauge-container">
+        <div class="single-chart">
+            <svg viewBox="0 0 36 36" class="circular-chart">
+                <path class="circle-bg" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" />
+                <path class="circle {stroke_class}" stroke-dasharray="{pct:.1f}, 100" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" />
+                <text x="18" y="20.35" class="percentage">{pct:.1f}%</text>
+            </svg>
+        </div>
+        <div class="gauge-label">Confidence Score</div>
+    </div>
+    """
+    st.markdown(svg_html, unsafe_allow_html=True)
+
+
+# --- Top Navigation Bar ---
+def render_top_nav():
+    cols = st.columns([2.5, 1, 1, 1, 1])
+    
+    with cols[0]:
+        st.markdown(
+            """
+            <div class="nav-brand">
+                <div class="nav-brand-icon">🛡️</div>
+                <div>DEEPFAKE SHIELD <span style="font-weight:400; font-size:0.9rem; color:var(--accent-cyan); display:block; margin-top:-4px;">AI Forensics Lab</span></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    nav_pages = [("🏠 Home", "Home"), ("🔍 Detect", "Detect"), ("📊 Reports", "Reports"), ("ℹ️ About", "About")]
+
+    for idx, (label, page_key) in enumerate(nav_pages, start=1):
+        with cols[idx]:
+            is_active = st.session_state.active_page == page_key
+            btn_type = "primary" if is_active else "tertiary"
+            if st.button(label, key=f"nav_btn_{page_key}", type=btn_type, use_container_width=True):
+                st.session_state.active_page = page_key
+                st.rerun()
+
+    st.markdown("<hr style='border:0; height:1px; background:rgba(255,255,255,0.08); margin:15px 0 25px 0;'>", unsafe_allow_html=True)
+
+
+# --- Sidebar Setup ---
+with st.sidebar:
+    st.markdown("### ⚙️ System Settings")
+    
+    st.markdown(
+        f"""
+        <div class="sidebar-badge">
+            <div class="sidebar-status-dot"></div>
+            <span>Hardware Engine: <b>{DEVICE.upper()}</b></span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    
+    key_input = st.text_input(
+        "Groq API key (Optional)",
+        value=os.environ.get("GROQ_API_KEY", ""),
+        type="password",
+        help="Powers LLM Explanation Agent. If omitted, standard rule-based explanations will be generated.",
+    )
+    if key_input:
+        os.environ["GROQ_API_KEY"] = key_input
+
+    st.markdown("<hr style='border:0; height:1px; background:rgba(255,255,255,0.08); margin:20px 0;'>", unsafe_allow_html=True)
+    
+    st.markdown("### 🔬 Multi-Agent Engine")
+    st.caption("• **Input Validation Agent**\n• **Media Type Agent**\n• **ViT / Wav2Vec2 Detectors**\n• **Confidence Scorer**\n• **Groq LLM Explainer**\n• **PDF/MD Report Generator**")
+    
+    st.markdown("<hr style='border:0; height:1px; background:rgba(255,255,255,0.08); margin:20px 0;'>", unsafe_allow_html=True)
+    st.caption("🔒 **Security Disclaimer**: Probabilistic multi-agent analysis. Verify high-stakes media with official forensic channels.")
+
+
+# =========================================================
+# PAGE 1: HOME PAGE
+# =========================================================
+def render_home_page():
+    # Hero Section
+    st.markdown(
+        """
+        <div class="hero-card">
+            <div class="hero-badge">⚡ MULTI-AGENT AI SYSTEM v2.0</div>
+            <div class="hero-title">Next-Gen <span class="hero-highlight">Deepfake Detection</span> & Digital Forensics</div>
+            <div class="hero-desc">
+                Identify manipulated media in seconds using autonomous multi-agent orchestration. Powered by Hugging Face Vision Transformers, Wav2Vec2 acoustic feature models, and Groq LLM synthesis.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    
+    col_cta1, col_cta2, col_cta3 = st.columns([1.5, 1, 1])
+    with col_cta1:
+        if st.button("🚀 Launch Deepfake Detector", key="home_cta_btn", type="primary", use_container_width=True):
+            st.session_state.active_page = "Detect"
+            st.rerun()
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # Key Statistics Grid
+    st.markdown("<h3 style='color:var(--text-main); font-weight:700; margin-bottom:15px;'>Platform Architecture Overview</h3>", unsafe_allow_html=True)
+    
+    s1, s2, s3 = st.columns(3)
+    with s1:
+        st.markdown(
+            """
+            <div class="stat-card">
+                <div class="stat-icon">🖼️</div>
+                <div>
+                    <div class="stat-value">ViT v2</div>
+                    <div class="stat-label">Image Artifact Classification</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with s2:
+        st.markdown(
+            """
+            <div class="stat-card">
+                <div class="stat-icon">🎙️</div>
+                <div>
+                    <div class="stat-value">Wav2Vec2</div>
+                    <div class="stat-label">Audio Acoustic Verification</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with s3:
+        st.markdown(
+            """
+            <div class="stat-card">
+                <div class="stat-icon">🤖</div>
+                <div>
+                    <div class="stat-value">LangGraph</div>
+                    <div class="stat-label">9-Node Autonomous Pipeline</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # Feature Highlight Cards
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(
+            """
+            <div class="glass-card">
+                <h4 style="color:var(--accent-cyan); margin-top:0;">📸 Image Forensic Detection</h4>
+                <p style="color:var(--text-muted); font-size:0.95rem; line-height:1.6;">
+                    Analyzes micro-level facial pixel inconsistencies, boundary noise, lighting incongruities, and ViT embeddings across JPG, PNG, WEBP, and BMP images.
+                </p>
+                <ul style="color:var(--text-sub); font-size:0.9rem; padding-left:20px;">
+                    <li>Detects AI face-swap & diffusion generation</li>
+                    <li>Evaluates classification confidence tiers</li>
+                </ul>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with c2:
+        st.markdown(
+            """
+            <div class="glass-card">
+                <h4 style="color:var(--accent-purple); margin-top:0;">🎵 Audio Synthetic Analysis</h4>
+                <p style="color:var(--text-muted); font-size:0.95rem; line-height:1.6;">
+                    Inspects acoustic waveforms, spectral anomalies, and synthetic voice cloning artifacts using Wav2Vec2 neural architecture across WAV, MP3, FLAC, OGG, and M4A.
+                </p>
+                <ul style="color:var(--text-sub); font-size:0.9rem; padding-left:20px;">
+                    <li>Detects AI voice synthesis & neural voice cloning</li>
+                    <li>Generates PDF, MD, and TXT diagnostic reports</li>
+                </ul>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+# =========================================================
+# PAGE 2: DETECT PAGE
+# =========================================================
+def render_detect_page():
+    st.markdown(
+        """
+        <div style="margin-bottom:20px;">
+            <h2 style="font-weight:800; margin-bottom:4px; background:linear-gradient(135deg,#fff,#94a3b8); -webkit-background-clip:text; -webkit-text-fill-color:transparent;">Deepfake Detection Workspace</h2>
+            <p style="color:var(--text-muted);">Upload media files for multi-agent validation, model inference, and natural language forensic report generation.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    media_kind = st.radio("Select Target Media Format:", ["Image", "Audio"], horizontal=True)
+
+    uploaded_file = None
+    col_up, col_prev = st.columns([1.2, 0.8])
+
+    with col_up:
+        # Streamlit renders widgets outside HTML divs, so wrap with a container styled via CSS
+        with st.container():
+            st.markdown('<div class="upload-zone-label">📂 Upload Media File</div>', unsafe_allow_html=True)
+            if media_kind == "Image":
+                uploaded_file = st.file_uploader(
+                    "Drag & drop an Image file here or click to browse",
+                    type=["jpg", "jpeg", "png", "bmp", "webp"],
+                    key="image_uploader",
+                )
+            else:
+                uploaded_file = st.file_uploader(
+                    "Drag & drop an Audio file here or click to browse",
+                    type=["wav", "mp3", "flac", "ogg", "m4a"],
+                    key="audio_uploader",
+                )
+
+    with col_prev:
+        with st.container():
+            if uploaded_file is not None:
+                st.markdown("<h5 style='color:var(--accent-cyan); margin-bottom:10px;'>📺 Media Preview</h5>", unsafe_allow_html=True)
+                if media_kind == "Image":
+                    st.image(uploaded_file, caption=f"📄 {uploaded_file.name}", width="stretch")
+                else:
+                    st.audio(uploaded_file)
+                    st.caption(f"🎵 Audio File: {uploaded_file.name}")
+            else:
+                st.markdown(
+                    """
+                    <div style="text-align:center; color:var(--text-sub); padding:40px 20px; border:1px dashed rgba(255,255,255,0.1); border-radius:14px;">
+                        <div style="font-size:2.5rem; margin-bottom:8px;">📁</div>
+                        <div style="font-weight:600;">No file uploaded yet</div>
+                        <div style="font-size:0.8rem; margin-top:4px;">Select a file to preview before analysis</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    analyze_clicked = st.button("⚡ Run Multi-Agent Analysis", key="analyze_btn", type="primary", disabled=uploaded_file is None, use_container_width=True)
+
+    if analyze_clicked and uploaded_file is not None:
+        placeholder = st.empty()
+        with placeholder.container():
+            st.markdown(
+                """
+                <div class="loading-wrapper">
+                    <div class="ai-spinner"></div>
+                    <div class="loading-text">Analyzing Media with Autonomous Agents...</div>
+                    <div class="loading-subtext">Executing Input Validation → Feature Extraction → ViT/Wav2Vec Inference → Groq LLM Synthesis</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        filepath = save_uploaded_file(uploaded_file)
+        try:
+            result = run_pipeline(filepath)
+        except Exception as e:
+            placeholder.empty()
+            st.error(f"Pipeline Execution Error: {e}")
+            st.stop()
+
+        placeholder.empty()
+
+        if result.get("error") and not result.get("prediction"):
+            st.error(f"❌ Analysis Failed: {result['error']}")
+        else:
+            prediction = result.get("prediction", "UNKNOWN")
+            confidence = result.get("confidence", 0.0) or 0.0
+            explanation = result.get("explanation", "-")
+            recommendation = result.get("recommendation", "-")
+            paths = result.get("report_paths", {})
+            conf_label = result.get("confidence_label", "Low")
+
+            # Append to Session History Log
+            st.session_state.history.append({
+                "file_name": uploaded_file.name,
+                "media_type": media_kind,
+                "prediction": prediction,
+                "confidence": confidence,
+                "confidence_label": conf_label,
+                "timestamp": timestamp_now(),
+                "paths": paths
+            })
+
+            # --- Detection Results Card ---
+            st.markdown("<h3 style='color:var(--text-main); font-weight:700; margin-top:20px;'>Detection Results</h3>", unsafe_allow_html=True)
+
+            res_col1, res_col2 = st.columns([1.2, 1])
+
+            with res_col1:
+                v_class = "verdict-real" if prediction == "REAL" else ("verdict-fake" if prediction == "DEEPFAKE" else "verdict-unknown")
+                b_class = "badge-real" if prediction == "REAL" else ("badge-fake" if prediction == "DEEPFAKE" else "badge-unknown")
+                
+                st.markdown(
+                    f"""
+                    <div class="verdict-card {v_class}">
+                        <div style="font-size:0.85rem; color:var(--text-muted); font-weight:600; text-transform:uppercase; letter-spacing:0.05em;">Forensic Verdict</div>
+                        <div class="verdict-badge {b_class}">{prediction}</div>
+                        <div style="margin-top:15px; font-size:0.9rem; color:var(--text-main);">
+                            Confidence Level: <b>{conf_label}</b> ({format_confidence(confidence)})
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            with res_col2:
+                st.markdown("<div class='glass-card' style='display:flex; justify-content:center; align-items:center;'>", unsafe_allow_html=True)
+                render_circular_gauge(confidence, prediction)
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # Explanation & Recommendation Cards
+            e_col, r_col = st.columns(2)
+            with e_col:
+                st.markdown(
+                    f"""
+                    <div class="glass-card">
+                        <h4 style="color:var(--accent-cyan); margin-top:0;">💡 Agent Forensic Explanation</h4>
+                        <p style="color:var(--text-main); font-size:0.95rem; line-height:1.6;">{explanation}</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            with r_col:
+                st.markdown(
+                    f"""
+                    <div class="glass-card">
+                        <h4 style="color:var(--accent-purple); margin-top:0;">🛡️ Actionable Recommendation</h4>
+                        <p style="color:var(--text-main); font-size:0.95rem; line-height:1.6;">{recommendation}</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            # Raw Scores Expander
+            with st.expander("🔬 View Raw Model Tensors & Scores"):
+                st.json(result.get("raw_scores", {}))
+
+            # Download Report Buttons
+            st.markdown("<h4 style='color:var(--text-main); margin-top:20px;'>📥 Download Forensic Reports</h4>", unsafe_allow_html=True)
+            dl_cols = st.columns(3)
+            if paths.get("txt"):
+                with open(paths["txt"], "rb") as f:
+                    dl_cols[0].download_button("📄 TXT Report", f, file_name=os.path.basename(paths["txt"]), key="dl_txt", use_container_width=True)
+            if paths.get("md"):
+                with open(paths["md"], "rb") as f:
+                    dl_cols[1].download_button("📝 Markdown Report", f, file_name=os.path.basename(paths["md"]), key="dl_md", use_container_width=True)
+            if paths.get("pdf"):
+                with open(paths["pdf"], "rb") as f:
+                    dl_cols[2].download_button("📕 PDF Report", f, file_name=os.path.basename(paths["pdf"]), key="dl_pdf", use_container_width=True)
+
+
+# =========================================================
+# PAGE 3: REPORTS PAGE
+# =========================================================
+def render_reports_page():
+    st.markdown(
+        """
+        <div style="margin-bottom:20px;">
+            <h2 style="font-weight:800; margin-bottom:4px; background:linear-gradient(135deg,#fff,#94a3b8); -webkit-background-clip:text; -webkit-text-fill-color:transparent;">Diagnostic Reports History</h2>
+            <p style="color:var(--text-muted);">Review and export all media scans completed during the current active session.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    history = st.session_state.history
+
+    if not history:
+        st.markdown(
+            """
+            <div class="glass-card" style="text-align:center; padding:50px 20px;">
+                <div style="font-size:3rem; margin-bottom:15px;">📊</div>
+                <h3 style="color:var(--text-main); font-weight:700;">No Detection Reports Yet</h3>
+                <p style="color:var(--text-muted);">Run an image or audio analysis on the Detect tab to generate downloadable reports.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("🔍 Go to Detect Workspace", key="reports_goto_detect_btn", type="primary"):
+            st.session_state.active_page = "Detect"
+            st.rerun()
+        return
+
+    # Summary Metrics Header
+    total_scans = len(history)
+    deepfakes = sum(1 for h in history if h["prediction"] == "DEEPFAKE")
+    reals = sum(1 for h in history if h["prediction"] == "REAL")
+
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.markdown(
+            f"""
+            <div class="stat-card">
+                <div class="stat-icon">📊</div>
+                <div>
+                    <div class="stat-value">{total_scans}</div>
+                    <div class="stat-label">Total Files Analyzed</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with m2:
+        st.markdown(
+            f"""
+            <div class="stat-card" style="border-color:rgba(239,68,68,0.3);">
+                <div class="stat-icon" style="color:var(--status-fake); background:rgba(239,68,68,0.1);">⚠️</div>
+                <div>
+                    <div class="stat-value" style="color:var(--status-fake);">{deepfakes}</div>
+                    <div class="stat-label">Deepfakes Identified</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with m3:
+        st.markdown(
+            f"""
+            <div class="stat-card" style="border-color:rgba(16,185,129,0.3);">
+                <div class="stat-icon" style="color:var(--status-real); background:rgba(16,185,129,0.1);">✅</div>
+                <div>
+                    <div class="stat-value" style="color:var(--status-real);">{reals}</div>
+                    <div class="stat-label">Authentic Media Verified</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown("<h3 style='color:var(--text-main); font-weight:700;'>Session History Log</h3>", unsafe_allow_html=True)
+
+    for idx, item in enumerate(reversed(history)):
+        b_style = "color:var(--status-real);" if item["prediction"] == "REAL" else ("color:var(--status-fake);" if item["prediction"] == "DEEPFAKE" else "color:var(--status-warn);")
+        
+        st.markdown(
+            f"""
+            <div class="glass-card" style="margin-bottom:15px; padding:18px 24px;">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <div>
+                        <h4 style="margin:0; color:var(--text-main);">{item['file_name']} <span style="font-size:0.8rem; color:var(--text-muted);">({item['media_type']})</span></h4>
+                        <div style="font-size:0.85rem; color:var(--text-sub); margin-top:4px;">Scanned: {item['timestamp']}</div>
+                    </div>
+                    <div style="text-align:right;">
+                        <div style="font-size:1.3rem; font-weight:800; {b_style}">{item['prediction']}</div>
+                        <div style="font-size:0.85rem; color:var(--text-muted);">Confidence: {format_confidence(item['confidence'])}</div>
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    if st.button("🗑️ Clear Session History", key="clear_history_btn"):
+        st.session_state.history = []
+        st.rerun()
+
+
+# =========================================================
+# PAGE 4: ABOUT PAGE
+# =========================================================
+def render_about_page():
+    st.markdown(
+        """
+        <div style="margin-bottom:20px;">
+            <h2 style="font-weight:800; margin-bottom:4px; background:linear-gradient(135deg,#fff,#94a3b8); -webkit-background-clip:text; -webkit-text-fill-color:transparent;">About Deepfake Shield AI</h2>
+            <p style="color:var(--text-muted);">Architecture specifications, machine learning model details, and technical framework stack.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        """
+        <div class="glass-card">
+            <h3 style="color:var(--accent-cyan); margin-top:0;">🧠 LangGraph Multi-Agent Architecture</h3>
+            <p style="color:var(--text-muted); line-height:1.6;">
+                The platform utilizes a stateful multi-agent directed graph built on <b>LangGraph</b>. Instead of relying on a single monolithic prompt or isolated classifier, specialized agent nodes process media sequentially and pass validated state:
+            </p>
+            <ol style="color:var(--text-main); line-height:1.9; padding-left:20px;">
+                <li><b>Supervisor Agent</b>: Orchestrates analysis workflow state and initializes execution tracking.</li>
+                <li><b>Input Validation Agent</b>: Validates file integrity, extension compliance, and file size metrics.</li>
+                <li><b>Media Type Agent</b>: Identifies image vs. audio input to route state to specialized ML models.</li>
+                <li><b>Image / Audio Detection Agents</b>: Invokes Hugging Face Transformers pipelines (ViT &amp; Wav2Vec2).</li>
+                <li><b>Confidence Agent</b>: Calculates numerical confidence tiers (Very High, High, Moderate, Low).</li>
+                <li><b>Explanation Agent</b>: Synthesizes plain-language explanations via Groq LLM (openai/gpt-oss-20b).</li>
+                <li><b>Recommendation Agent</b>: Generates risk mitigation advice based on prediction confidence.</li>
+                <li><b>Report Generator Agent</b>: Produces standalone PDF, Markdown, and TXT diagnostic reports.</li>
+            </ol>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown(
+            """
+            <div class="glass-card">
+                <h4 style="color:var(--text-main); margin-top:0;">📦 Neural Model Specifications</h4>
+                <ul style="color:var(--text-muted); line-height:1.7; font-size:0.95rem;">
+                    <li><b>Image Model:</b> <code style="color:var(--accent-cyan);">prithivMLmods/Deep-Fake-Detector-v2-Model</code> (Fallback: <code style="color:var(--text-sub);">Wvolf/ViT_Deepfake_Detection</code>)</li>
+                    <li><b>Audio Model:</b> <code style="color:var(--accent-purple);">MelodyMachine/Deepfake-audio-detection-V2</code> (Fallback: <code style="color:var(--text-sub);">mo-thecreator/Deepfake-audio-detection</code>)</li>
+                    <li><b>LLM Engine:</b> <code style="color:var(--accent-cyan);">openai/gpt-oss-20b</code> on Groq LPUs</li>
+                </ul>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with col2:
+        st.markdown(
+            """
+            <div class="glass-card">
+                <h4 style="color:var(--text-main); margin-top:0;">⚙️ Technical Stack</h4>
+                <ul style="color:var(--text-muted); line-height:1.7; font-size:0.95rem;">
+                    <li><b>Framework:</b> Streamlit 1.38+</li>
+                    <li><b>Orchestration:</b> LangGraph & LangChain</li>
+                    <li><b>Forensics Stack:</b> OpenCV, PIL, Librosa, PyDub</li>
+                    <li><b>Report Generator:</b> FPDF2</li>
+                </ul>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+# =========================================================
+# MAIN APP ROUTER
+# =========================================================
+
+def main():
+    render_top_nav()
+
+    page = st.session_state.active_page
+
+    if page == "Home":
+        render_home_page()
+    elif page == "Detect":
+        render_detect_page()
+    elif page == "Reports":
+        render_reports_page()
+    elif page == "About":
+        render_about_page()
+
+    st.markdown(
+        """
+        <div class="dashboard-footer">
+            Deepfake Shield AI Dashboard &bull; Multi-Agent Digital Forensics Engine &bull; Built with Streamlit & LangGraph
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+if __name__ == "__main__":
+    main()
