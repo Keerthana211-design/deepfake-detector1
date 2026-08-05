@@ -1,4 +1,4 @@
-streamlit>=1.38
+streamlit==1.49.1
 
 # --- Core ML stack ---
 numpy>=1.26,<3.0
