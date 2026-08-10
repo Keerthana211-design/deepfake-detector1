@@ -149,7 +149,7 @@ def normalize_label(label: str) -> str:
     """
     l = str(label).strip().lower().replace("_", " ").replace("-", " ")
     fake_keywords = ("fake", "spoof", "deepfake", "synthetic", "generated", "ai generated", "manipulated")
-    real_keywords = ("real", "bonafide", "bonafide", "genuine", "authentic", "human", "original")
+    real_keywords = ("real","realism", "bonafide", "bonafide", "genuine", "authentic", "human", "original")
     if any(k in l for k in fake_keywords):
         return "DEEPFAKE"
     if any(k in l for k in real_keywords):
