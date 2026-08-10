@@ -58,8 +58,8 @@ import streamlit as st
 
 
 class Config:
-    IMAGE_MODEL_ID = "prithivMLmods/Deep-Fake-Detector-v2-Model"
-    IMAGE_MODEL_FALLBACK = "Wvolf/ViT_Deepfake_Detection"
+    IMAGE_MODEL_ID = "Wvolf/ViT_Deepfake_Detection"
+    IMAGE_MODEL_FALLBACK = "prithivMLmods/Deep-Fake-Detector-v2-Model"
 
     AUDIO_MODEL_ID = "MelodyMachine/Deepfake-audio-detection-V2"
     AUDIO_MODEL_FALLBACK = "mo-thecreator/Deepfake-audio-detection"
@@ -142,29 +142,57 @@ def format_confidence(score: float) -> str:
 
 
 def normalize_label(label: str) -> str:
-    """Map model labels to the two semantic classes without silently guessing.
+    """Map known model labels to REAL / DEEPFAKE.
 
-    Unknown labels remain UNKNOWN so a newly changed model cannot accidentally be
-    interpreted as REAL.
+    Unknown labels remain UNKNOWN. We never silently interpret an
+    unrecognized model label as REAL or DEEPFAKE.
     """
-    l = str(label).strip().lower().replace("_", " ").replace("-", " ")
-    fake_keywords = ("fake", "spoof", "deepfake", "synthetic", "generated", "ai generated", "manipulated")
-    real_keywords = ("real","realism", "bonafide", "bonafide", "genuine", "authentic", "human", "original")
-    if any(k in l for k in fake_keywords):
+    l = (
+        str(label)
+        .strip()
+        .lower()
+        .replace("_", " ")
+        .replace("-", " ")
+    )
+
+    fake_keywords = (
+        "fake",
+        "spoof",
+        "deepfake",
+        "synthetic",
+        "generated",
+        "ai generated",
+        "manipulated",
+        "forged",
+    )
+
+    real_keywords = (
+        "real",
+        "realism",
+        "bonafide",
+        "genuine",
+        "authentic",
+        "human",
+        "original",
+    )
+
+    if any(keyword in l for keyword in fake_keywords):
         return "DEEPFAKE"
-    if any(k in l for k in real_keywords):
+
+    if any(keyword in l for keyword in real_keywords):
         return "REAL"
+
     return "UNKNOWN"
 
 
 def _prepare_image_for_model(img: Image.Image) -> Image.Image:
-    """Apply one deterministic inference preprocessing path."""
+    """Apply deterministic preprocessing before model inference."""
     img = img.convert("RGB")
-    # Keep the model input deterministic and bounded. The HF image processor will
-    # perform its own model-specific normalization after receiving this image.
-    return img.resize(Config.IMAGE_TARGET_SIZE, Image.Resampling.LANCZOS)
 
-
+    return img.resize(
+        Config.IMAGE_TARGET_SIZE,
+        Image.Resampling.LANCZOS
+    )
 def _image_quality(img: Image.Image) -> Dict[str, Any]:
     """Cheap quality checks used to avoid overconfident predictions."""
     arr = np.asarray(img.convert("RGB"))
@@ -194,31 +222,86 @@ def _image_quality(img: Image.Image) -> Dict[str, Any]:
 
 
 def _aggregate_image_scores(results) -> Dict[str, float]:
-    """Aggregate all classifier outputs into REAL/DEEPFAKE probabilities."""
-    scores = {"REAL": 0.0, "DEEPFAKE": 0.0}
+    """Convert classifier outputs into REAL/DEEPFAKE probabilities.
+
+    Only recognized labels are used. Unknown labels are ignored rather
+    than being guessed as REAL or DEEPFAKE.
+    """
+    scores = {
+        "REAL": 0.0,
+        "DEEPFAKE": 0.0,
+    }
+
     for item in results:
-        semantic = normalize_label(item.get("label", ""))
+        label = item.get("label", "")
         score = float(item.get("score", 0.0))
-        if semantic in scores:
-            scores[semantic] += max(0.0, score)
+
+        semantic = normalize_label(label)
+
+        if semantic == "REAL":
+            scores["REAL"] += max(0.0, score)
+
+        elif semantic == "DEEPFAKE":
+            scores["DEEPFAKE"] += max(0.0, score)
+
     total = scores["REAL"] + scores["DEEPFAKE"]
+
     if total > 0:
-        scores = {k: v / total for k, v in scores.items()}
+        scores["REAL"] /= total
+        scores["DEEPFAKE"] /= total
+
     return scores
 
 
-def _decide_image_label(real_p: float, fake_p: float, quality: Dict[str, Any]) -> tuple[str, float, str]:
-    """Conservative decision rule; returns label, confidence and reason."""
+def _decide_image_label(
+    real_p: float,
+    fake_p: float,
+    quality: Dict[str, Any]
+) -> tuple[str, float, str]:
+    """Make a conservative REAL / DEEPFAKE / UNKNOWN decision."""
+
     confidence = max(real_p, fake_p)
     margin = abs(real_p - fake_p)
-    if not quality.get("usable", True):
-        return "UNKNOWN", confidence, "Image quality is insufficient for a reliable classification."
-    if confidence < Config.IMAGE_UNCERTAIN_CONFIDENCE:
-        return "UNKNOWN", confidence, "Model confidence is too low."
-    if confidence < Config.IMAGE_MIN_CONFIDENCE or margin < Config.IMAGE_MIN_MARGIN:
-        return "UNKNOWN", confidence, "Model evidence is not decisive enough."
-    return ("REAL" if real_p > fake_p else "DEEPFAKE"), confidence, "Model evidence passed the conservative decision policy."
 
+    # Poor-quality images should not receive a confident verdict.
+    if not quality.get("usable", True):
+        return (
+            "UNKNOWN",
+            confidence,
+            "Image quality is insufficient for a reliable classification."
+        )
+
+    # Very low model confidence.
+    if confidence < Config.IMAGE_UNCERTAIN_CONFIDENCE:
+        return (
+            "UNKNOWN",
+            confidence,
+            "Model confidence is too low."
+        )
+
+    # Confidence or difference between classes is insufficient.
+    if (
+        confidence < Config.IMAGE_MIN_CONFIDENCE
+        or margin < Config.IMAGE_MIN_MARGIN
+    ):
+        return (
+            "UNKNOWN",
+            confidence,
+            "Model evidence is not decisive enough."
+        )
+
+    if real_p > fake_p:
+        return (
+            "REAL",
+            confidence,
+            "Model evidence passed the conservative decision policy."
+        )
+
+    return (
+        "DEEPFAKE",
+        confidence,
+        "Model evidence passed the conservative decision policy."
+    )
 
 # =========================================================
 # LANGGRAPH STATE
@@ -336,64 +419,157 @@ def media_detection_agent(state: DeepfakeState) -> DeepfakeState:
 def image_detection_agent(state: DeepfakeState) -> DeepfakeState:
     if state.get("media_type") != "image":
         return state
+
     try:
+        # ---------------------------------------------------------
+        # Load image
+        # ---------------------------------------------------------
         img = safe_load_image(state["filepath"])
+
         if img is None:
-            state["error"] = "Could not decode the uploaded image (possibly corrupted)."
+            state["error"] = (
+                "Could not decode the uploaded image "
+                "(possibly corrupted)."
+            )
             state["prediction"] = "UNKNOWN"
             state["raw_scores"] = {}
             return state
 
+        # ---------------------------------------------------------
+        # Image quality analysis
+        # ---------------------------------------------------------
         quality = _image_quality(img)
         state["image_quality"] = quality
 
+        # ---------------------------------------------------------
+        # Load model
+        # ---------------------------------------------------------
         clf = load_image_model()
+
         if clf is None:
-            state["error"] = "Image deepfake model failed to load (check internet connection)."
+            state["error"] = (
+                "Image deepfake model failed to load "
+                "(check internet connection)."
+            )
             state["prediction"] = "UNKNOWN"
             state["raw_scores"] = {}
             return state
 
-        # Pass the same normalized/resized image to the classifier every time.
+        # ---------------------------------------------------------
+        # Prepare image
+        # ---------------------------------------------------------
         model_img = _prepare_image_for_model(img)
+
+        # ---------------------------------------------------------
+        # Run classifier
+        # ---------------------------------------------------------
         try:
             results = clf(model_img, top_k=None)
         except TypeError:
             results = clf(model_img)
 
-        results = sorted(results, key=lambda x: float(x.get("score", 0.0)), reverse=True)
-        raw_scores = {str(r["label"]): float(r["score"]) for r in results}
+        # ---------------------------------------------------------
+        # Sort results by confidence
+        # ---------------------------------------------------------
+        results = sorted(
+            results,
+            key=lambda x: float(x.get("score", 0.0)),
+            reverse=True
+        )
+
+        # ---------------------------------------------------------
+        # DEBUG: print the actual model output
+        # ---------------------------------------------------------
+        print("\n" + "=" * 50)
+        print("RAW IMAGE MODEL OUTPUT")
+        print("=" * 50)
+
+        for result in results:
+            print(
+                f"Label: {result.get('label')} | "
+                f"Score: {float(result.get('score', 0.0)):.6f}"
+            )
+
+        print("=" * 50 + "\n")
+
+        # ---------------------------------------------------------
+        # Store original model scores
+        # ---------------------------------------------------------
+        raw_scores = {
+            str(result["label"]): float(result["score"])
+            for result in results
+        }
+
+        # ---------------------------------------------------------
+        # Convert model labels into REAL / DEEPFAKE
+        # ---------------------------------------------------------
         semantic = _aggregate_image_scores(results)
+
         real_p = float(semantic.get("REAL", 0.0))
         fake_p = float(semantic.get("DEEPFAKE", 0.0))
 
-        # If the model exposes neither semantic class, never guess REAL.
+        # ---------------------------------------------------------
+        # Unknown model labels
+        # ---------------------------------------------------------
         if real_p == 0.0 and fake_p == 0.0:
             state["prediction"] = "UNKNOWN"
             state["confidence"] = 0.0
             state["confidence_label"] = "Low"
             state["raw_scores"] = raw_scores
-            state["error"] = "The selected model returned labels that could not be mapped to REAL/DEEPFAKE."
+            state["real_probability"] = 0.0
+            state["deepfake_probability"] = 0.0
+            state["decision_margin"] = 0.0
+
+            state["error"] = (
+                "The selected model returned labels that could not "
+                "be mapped to REAL or DEEPFAKE."
+            )
+
             return state
 
-        prediction, confidence, reason = _decide_image_label(real_p, fake_p, quality)
+        # ---------------------------------------------------------
+        # Final conservative decision
+        # ---------------------------------------------------------
+        prediction, confidence, reason = _decide_image_label(
+            real_p,
+            fake_p,
+            quality
+        )
+
+        # ---------------------------------------------------------
+        # Store results
+        # ---------------------------------------------------------
         state["prediction"] = prediction
         state["raw_scores"] = raw_scores
+
         state["real_probability"] = real_p
         state["deepfake_probability"] = fake_p
+
         state["decision_margin"] = abs(real_p - fake_p)
+
         state["confidence"] = confidence
         state["decision_reason"] = reason
 
+        if confidence >= 0.75:
+            state["confidence_label"] = "High"
+        elif confidence >= 0.60:
+            state["confidence_label"] = "Medium"
+        else:
+            state["confidence_label"] = "Low"
+
     except Exception as e:
         traceback.print_exc()
+
         state["error"] = f"Image detection failed: {e}"
         state["prediction"] = "UNKNOWN"
         state["raw_scores"] = {}
+
     finally:
         gc.collect()
+
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
+
     return state
 
 
