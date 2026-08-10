@@ -58,8 +58,8 @@ import streamlit as st
 
 
 class Config:
-    IMAGE_MODEL_ID = "Wvolf/ViT_Deepfake_Detection"
-    IMAGE_MODEL_FALLBACK = "prithivMLmods/Deep-Fake-Detector-v2-Model"
+    IMAGE_MODEL_ID = "prithivMLmods/Deep-Fake-Detector-v2-Model"
+    IMAGE_MODEL_FALLBACK = "Wvolf/ViT_Deepfake_Detection"
 
     AUDIO_MODEL_ID = "MelodyMachine/Deepfake-audio-detection-V2"
     AUDIO_MODEL_FALLBACK = "mo-thecreator/Deepfake-audio-detection"
