@@ -76,6 +76,16 @@ class Config:
     AUDIO_SAMPLE_RATE = 16000
     AUDIO_MAX_SECONDS = 10
     IMAGE_TARGET_SIZE = (224, 224)
+    # Conservative decision policy. These are NOT claimed as universal thresholds;
+    # they are intentionally conservative defaults until calibrated on a labeled
+    # validation set with evaluate_detector.py.
+    IMAGE_MIN_CONFIDENCE = 0.75
+    IMAGE_MIN_MARGIN = 0.20
+    IMAGE_UNCERTAIN_CONFIDENCE = 0.60
+    IMAGE_MAX_BLUR_SCORE = 45.0
+    IMAGE_MIN_BRIGHTNESS = 15.0
+    IMAGE_MAX_BRIGHTNESS = 245.0
+    IMAGE_MIN_DIMENSION = 64
 
     REPORT_DIR = os.environ.get("REPORT_DIR", tempfile.gettempdir())
 
@@ -132,14 +142,82 @@ def format_confidence(score: float) -> str:
 
 
 def normalize_label(label: str) -> str:
-    l = label.strip().lower()
-    fake_keywords = ["fake", "spoof", "deepfake", "synthetic", "generated", "ai"]
-    real_keywords = ["real", "bonafide", "genuine", "authentic", "human"]
+    """Map model labels to the two semantic classes without silently guessing.
+
+    Unknown labels remain UNKNOWN so a newly changed model cannot accidentally be
+    interpreted as REAL.
+    """
+    l = str(label).strip().lower().replace("_", " ").replace("-", " ")
+    fake_keywords = ("fake", "spoof", "deepfake", "synthetic", "generated", "ai generated", "manipulated")
+    real_keywords = ("real", "bonafide", "bonafide", "genuine", "authentic", "human", "original")
     if any(k in l for k in fake_keywords):
         return "DEEPFAKE"
     if any(k in l for k in real_keywords):
         return "REAL"
     return "UNKNOWN"
+
+
+def _prepare_image_for_model(img: Image.Image) -> Image.Image:
+    """Apply one deterministic inference preprocessing path."""
+    img = img.convert("RGB")
+    # Keep the model input deterministic and bounded. The HF image processor will
+    # perform its own model-specific normalization after receiving this image.
+    return img.resize(Config.IMAGE_TARGET_SIZE, Image.Resampling.LANCZOS)
+
+
+def _image_quality(img: Image.Image) -> Dict[str, Any]:
+    """Cheap quality checks used to avoid overconfident predictions."""
+    arr = np.asarray(img.convert("RGB"))
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    brightness = float(np.mean(gray))
+    contrast = float(np.std(gray))
+    blur_score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    w, h = img.size
+    issues = []
+    if min(w, h) < Config.IMAGE_MIN_DIMENSION:
+        issues.append("image resolution is too small")
+    if blur_score < Config.IMAGE_MAX_BLUR_SCORE:
+        issues.append("image may be too blurry")
+    if brightness < Config.IMAGE_MIN_BRIGHTNESS:
+        issues.append("image is extremely dark")
+    if brightness > Config.IMAGE_MAX_BRIGHTNESS:
+        issues.append("image is extremely bright")
+    return {
+        "width": w,
+        "height": h,
+        "brightness": round(brightness, 2),
+        "contrast": round(contrast, 2),
+        "blur_score": round(blur_score, 2),
+        "usable": not issues,
+        "issues": issues,
+    }
+
+
+def _aggregate_image_scores(results) -> Dict[str, float]:
+    """Aggregate all classifier outputs into REAL/DEEPFAKE probabilities."""
+    scores = {"REAL": 0.0, "DEEPFAKE": 0.0}
+    for item in results:
+        semantic = normalize_label(item.get("label", ""))
+        score = float(item.get("score", 0.0))
+        if semantic in scores:
+            scores[semantic] += max(0.0, score)
+    total = scores["REAL"] + scores["DEEPFAKE"]
+    if total > 0:
+        scores = {k: v / total for k, v in scores.items()}
+    return scores
+
+
+def _decide_image_label(real_p: float, fake_p: float, quality: Dict[str, Any]) -> tuple[str, float, str]:
+    """Conservative decision rule; returns label, confidence and reason."""
+    confidence = max(real_p, fake_p)
+    margin = abs(real_p - fake_p)
+    if not quality.get("usable", True):
+        return "UNKNOWN", confidence, "Image quality is insufficient for a reliable classification."
+    if confidence < Config.IMAGE_UNCERTAIN_CONFIDENCE:
+        return "UNKNOWN", confidence, "Model confidence is too low."
+    if confidence < Config.IMAGE_MIN_CONFIDENCE or margin < Config.IMAGE_MIN_MARGIN:
+        return "UNKNOWN", confidence, "Model evidence is not decisive enough."
+    return ("REAL" if real_p > fake_p else "DEEPFAKE"), confidence, "Model evidence passed the conservative decision policy."
 
 
 # =========================================================
@@ -155,6 +233,10 @@ class DeepfakeState(TypedDict, total=False):
     media_type: Literal["image", "audio", "unknown"]
     prediction: Literal["REAL", "DEEPFAKE", "UNKNOWN"]
     raw_scores: Dict[str, float]
+    real_probability: float
+    deepfake_probability: float
+    decision_margin: float
+    image_quality: Dict[str, Any]
     confidence: float
     confidence_label: str
     explanation: str
@@ -262,8 +344,8 @@ def image_detection_agent(state: DeepfakeState) -> DeepfakeState:
             state["raw_scores"] = {}
             return state
 
-        cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        cv2.resize(cv_img, Config.IMAGE_TARGET_SIZE)
+        quality = _image_quality(img)
+        state["image_quality"] = quality
 
         clf = load_image_model()
         if clf is None:
@@ -272,13 +354,37 @@ def image_detection_agent(state: DeepfakeState) -> DeepfakeState:
             state["raw_scores"] = {}
             return state
 
-        results = clf(img)
-        raw_scores = {r["label"]: float(r["score"]) for r in results}
-        top = results[0]
-        prediction = normalize_label(top["label"])
-        state["prediction"] = prediction if prediction != "UNKNOWN" else "REAL"
+        # Pass the same normalized/resized image to the classifier every time.
+        model_img = _prepare_image_for_model(img)
+        try:
+            results = clf(model_img, top_k=None)
+        except TypeError:
+            results = clf(model_img)
+
+        results = sorted(results, key=lambda x: float(x.get("score", 0.0)), reverse=True)
+        raw_scores = {str(r["label"]): float(r["score"]) for r in results}
+        semantic = _aggregate_image_scores(results)
+        real_p = float(semantic.get("REAL", 0.0))
+        fake_p = float(semantic.get("DEEPFAKE", 0.0))
+
+        # If the model exposes neither semantic class, never guess REAL.
+        if real_p == 0.0 and fake_p == 0.0:
+            state["prediction"] = "UNKNOWN"
+            state["confidence"] = 0.0
+            state["confidence_label"] = "Low"
+            state["raw_scores"] = raw_scores
+            state["error"] = "The selected model returned labels that could not be mapped to REAL/DEEPFAKE."
+            return state
+
+        prediction, confidence, reason = _decide_image_label(real_p, fake_p, quality)
+        state["prediction"] = prediction
         state["raw_scores"] = raw_scores
-        state["confidence"] = float(top["score"])
+        state["real_probability"] = real_p
+        state["deepfake_probability"] = fake_p
+        state["decision_margin"] = abs(real_p - fake_p)
+        state["confidence"] = confidence
+        state["decision_reason"] = reason
+
     except Exception as e:
         traceback.print_exc()
         state["error"] = f"Image detection failed: {e}"
@@ -320,9 +426,10 @@ def audio_detection_agent(state: DeepfakeState) -> DeepfakeState:
         raw_scores = {r["label"]: float(r["score"]) for r in results}
         top = results[0]
         prediction = normalize_label(top["label"])
-        state["prediction"] = prediction if prediction != "UNKNOWN" else "REAL"
+        state["prediction"] = prediction
         state["raw_scores"] = raw_scores
         state["confidence"] = float(top["score"])
+        state["decision_reason"] = "Audio model top-class prediction."
     except Exception as e:
         traceback.print_exc()
         state["error"] = f"Audio detection failed: {e}"
@@ -337,11 +444,13 @@ def audio_detection_agent(state: DeepfakeState) -> DeepfakeState:
 
 def confidence_agent(state: DeepfakeState) -> DeepfakeState:
     confidence = state.get("confidence", 0.0) or 0.0
-    if confidence >= 0.85:
+    if state.get("prediction") == "UNKNOWN":
+        label = "Uncertain"
+    elif confidence >= 0.90:
         label = "Very High"
-    elif confidence >= 0.65:
+    elif confidence >= 0.75:
         label = "High"
-    elif confidence >= 0.5:
+    elif confidence >= 0.60:
         label = "Moderate"
     else:
         label = "Low"
@@ -355,20 +464,15 @@ def _template_explanation(state: DeepfakeState) -> str:
     conf = format_confidence(state.get("confidence", 0.0) or 0.0)
     scores = state.get("raw_scores", {})
     scores_str = ", ".join(f"{k}: {format_confidence(v)}" for k, v in scores.items()) or "n/a"
-
+    reason = state.get("decision_reason", "")
     if pred == "DEEPFAKE":
-        return (
-            f"The {media} was classified as a likely DEEPFAKE with {conf} confidence. "
-            f"The model detected statistical patterns commonly associated with AI-generated "
-            f"or manipulated media. Raw model scores: {scores_str}."
-        )
-    elif pred == "REAL":
-        return (
-            f"The {media} was classified as likely REAL/authentic with {conf} confidence. "
-            f"No strong indicators of AI generation or manipulation were detected. "
-            f"Raw model scores: {scores_str}."
-        )
-    return f"The system could not reach a confident conclusion about this {media}. Raw model scores: {scores_str}."
+        return (f"The {media} was classified as likely DEEPFAKE with {conf} confidence. "
+                f"This is a model prediction, not forensic proof. {reason} Raw model scores: {scores_str}.")
+    if pred == "REAL":
+        return (f"The {media} was classified as likely REAL with {conf} confidence. "
+                f"This is a model prediction, not proof of authenticity. {reason} Raw model scores: {scores_str}.")
+    return (f"The system returned UNCERTAIN for this {media}. {reason} "
+            f"Do not treat this result as evidence of a deepfake. Raw model scores: {scores_str}.")
 
 
 def explanation_agent(state: DeepfakeState) -> DeepfakeState:
@@ -434,7 +538,8 @@ def recommendation_agent(state: DeepfakeState) -> DeepfakeState:
             "high-stakes (legal, financial, identity-related), corroborate with additional evidence."
         )
     else:
-        rec = "The system could not confidently classify this media. Try a clearer/uncorrupted file."
+        rec = ("The system could not confidently classify this media. Treat the result as UNCERTAIN; "
+               "use a clearer image or an independent forensic method rather than assuming it is fake.")
 
     state["recommendation"] = rec
     return state
@@ -447,6 +552,11 @@ def _build_report_dict(state: DeepfakeState) -> Dict[str, str]:
         "Prediction": state.get("prediction", "N/A"),
         "Confidence Score": format_confidence(state.get("confidence", 0.0) or 0.0),
         "Confidence Label": state.get("confidence_label", "N/A"),
+        "Real Probability": format_confidence(state.get("real_probability", 0.0) or 0.0),
+        "Deepfake Probability": format_confidence(state.get("deepfake_probability", 0.0) or 0.0),
+        "Decision Margin": format_confidence(state.get("decision_margin", 0.0) or 0.0),
+        "Image Quality": str(state.get("image_quality", {})),
+        "Decision Reason": state.get("decision_reason", "N/A"),
         "Explanation": state.get("explanation", "N/A"),
         "Recommendation": state.get("recommendation", "N/A"),
         "Timestamp": timestamp_now(),
@@ -682,7 +792,7 @@ with st.sidebar:
     st.markdown("<hr style='border:0; height:1px; background:rgba(255,255,255,0.08); margin:20px 0;'>", unsafe_allow_html=True)
     
     st.markdown("### 🔬 Multi-Agent Engine")
-    st.caption("• **Input Validation Agent**\n• **Media Type Agent**\n• **ViT / Wav2Vec2 Detectors**\n• **Confidence Scorer**\n• **Groq LLM Explainer**\n• **PDF/MD Report Generator**")
+    st.caption("• **Input Validation Agent**\n• **Media Type Agent**\n• **ViT / Wav2Vec2 Detectors**\n• **Conservative Confidence + Quality Gate**\n• **Groq LLM Explainer**\n• **PDF/MD Report Generator**")
     
     st.markdown("<hr style='border:0; height:1px; background:rgba(255,255,255,0.08); margin:20px 0;'>", unsafe_allow_html=True)
     st.caption("🔒 **Security Disclaimer**: Probabilistic multi-agent analysis. Verify high-stakes media with official forensic channels.")
@@ -897,6 +1007,8 @@ def render_detect_page():
                 "prediction": prediction,
                 "confidence": confidence,
                 "confidence_label": conf_label,
+                "real_probability": result.get("real_probability", 0.0),
+                "deepfake_probability": result.get("deepfake_probability", 0.0),
                 "timestamp": timestamp_now(),
                 "paths": paths
             })
@@ -927,6 +1039,19 @@ def render_detect_page():
                 st.markdown("<div class='glass-card' style='display:flex; justify-content:center; align-items:center;'>", unsafe_allow_html=True)
                 render_circular_gauge(confidence, prediction)
                 st.markdown("</div>", unsafe_allow_html=True)
+
+            if media_kind == "Image":
+                rp = float(result.get("real_probability", 0.0) or 0.0)
+                fp = float(result.get("deepfake_probability", 0.0) or 0.0)
+                q = result.get("image_quality", {}) or {}
+                pc1, pc2, pc3 = st.columns(3)
+                pc1.metric("Real probability", format_confidence(rp))
+                pc2.metric("Deepfake probability", format_confidence(fp))
+                pc3.metric("Decision margin", format_confidence(result.get("decision_margin", 0.0) or 0.0))
+                if prediction == "UNKNOWN":
+                    st.warning("UNCERTAIN: the model did not provide enough reliable evidence for a binary decision. " + str(result.get("decision_reason", "")))
+                if q.get("issues"):
+                    st.info("Image quality checks: " + "; ".join(q["issues"]) + ".")
 
             st.markdown("<br>", unsafe_allow_html=True)
 
