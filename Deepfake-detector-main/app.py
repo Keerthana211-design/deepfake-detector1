@@ -928,14 +928,22 @@ def calibrate_image_label_orientation(real_sample_filepath: str, fake_sample_fil
     backwards. This is the only reliable way to know the correct orientation for
     a given model/environment — do not hardcode it.
 
-    Returns a dict with per-sample raw predictions and a `recommended_invert`
-    bool the caller can use to set st.session_state.invert_image_labels.
+    Also surfaces the active model id and full score breakdown for each sample,
+    because a "both predicted the same class" result usually isn't a labeling
+    problem at all — it's either a systematic model bias (e.g. sensitivity to
+    JPEG recompression from apps like WhatsApp) or the wrong model having loaded
+    silently. Returning only the top label would hide the evidence needed to
+    tell those apart.
+
+    Returns a dict with per-sample raw predictions/scores and a
+    `recommended_invert` bool the caller can use to set
+    st.session_state.invert_image_labels.
     """
     clf = load_image_model()
     if clf is None:
         return {"ok": False, "reason": "Image model failed to load."}
 
-    def _raw_top_label(filepath: str) -> Optional[str]:
+    def _raw_prediction(filepath: str) -> Optional[Dict[str, Any]]:
         img = safe_load_image(filepath)
         if img is None:
             return None
@@ -945,25 +953,43 @@ def calibrate_image_label_orientation(real_sample_filepath: str, fake_sample_fil
         except TypeError:
             results = clf(model_img)
         results = sorted(results, key=lambda x: float(x.get("score", 0.0)), reverse=True)
-        return normalize_label(results[0].get("label", "")) if results else None
+        if not results:
+            return None
+        return {
+            "top_label": normalize_label(results[0].get("label", "")),
+            "top_score": float(results[0].get("score", 0.0)),
+            "all_scores": {str(r.get("label")): float(r.get("score", 0.0)) for r in results},
+        }
 
-    real_pred = _raw_top_label(real_sample_filepath)
-    fake_pred = _raw_top_label(fake_sample_filepath)
+    real_info = _raw_prediction(real_sample_filepath)
+    fake_info = _raw_prediction(fake_sample_filepath)
 
-    if real_pred is None or fake_pred is None:
+    if real_info is None or fake_info is None:
         return {"ok": False, "reason": "Could not decode one or both calibration images."}
+
+    real_pred = real_info["top_label"]
+    fake_pred = fake_info["top_label"]
 
     # Correctly-oriented model: real sample -> REAL, fake sample -> DEEPFAKE.
     correct_as_is = (real_pred == "REAL") and (fake_pred == "DEEPFAKE")
     # Backwards model: real sample -> DEEPFAKE, fake sample -> REAL.
     backwards = (real_pred == "DEEPFAKE") and (fake_pred == "REAL")
+    # Neither swap nor as-is separates them — e.g. both predicted the same
+    # class. This is NOT a labeling problem; inverting won't fix it.
+    both_same_class = (real_pred == fake_pred) and real_pred in ("REAL", "DEEPFAKE")
 
     return {
         "ok": True,
+        "active_model_id": _ACTIVE_IMAGE_MODEL_ID,
         "real_sample_raw_prediction": real_pred,
+        "real_sample_confidence": real_info["top_score"],
+        "real_sample_all_scores": real_info["all_scores"],
         "fake_sample_raw_prediction": fake_pred,
+        "fake_sample_confidence": fake_info["top_score"],
+        "fake_sample_all_scores": fake_info["all_scores"],
         "correct_as_is": correct_as_is,
         "backwards": backwards,
+        "both_same_class": both_same_class,
         "recommended_invert": bool(backwards),
         "ambiguous": not correct_as_is and not backwards,
     }
@@ -1259,8 +1285,17 @@ def render_detect_page():
                 if not cal_result.get("ok"):
                     st.error(f"Calibration failed: {cal_result.get('reason')}")
                 else:
-                    st.write(f"Known-REAL sample → model's raw prediction: **{cal_result['real_sample_raw_prediction']}**")
-                    st.write(f"Known-DEEPFAKE sample → model's raw prediction: **{cal_result['fake_sample_raw_prediction']}**")
+                    st.caption(f"Active image model: `{cal_result.get('active_model_id', 'unknown')}`")
+                    st.write(
+                        f"Known-REAL sample → **{cal_result['real_sample_raw_prediction']}** "
+                        f"({format_confidence(cal_result['real_sample_confidence'])} confidence)"
+                    )
+                    st.json(cal_result["real_sample_all_scores"])
+                    st.write(
+                        f"Known-DEEPFAKE sample → **{cal_result['fake_sample_raw_prediction']}** "
+                        f"({format_confidence(cal_result['fake_sample_confidence'])} confidence)"
+                    )
+                    st.json(cal_result["fake_sample_all_scores"])
 
                     if cal_result["correct_as_is"]:
                         st.success("✅ Model output is correctly oriented. Leave the sidebar 'Invert' toggle OFF.")
@@ -1268,11 +1303,22 @@ def render_detect_page():
                     elif cal_result["backwards"]:
                         st.warning("🔁 Model output is backwards for this deployment. Enabling the invert toggle automatically.")
                         st.session_state.invert_image_labels = True
+                    elif cal_result["both_same_class"]:
+                        st.error(
+                            "⚠️ Both samples were predicted as the SAME class "
+                            f"(`{cal_result['real_sample_raw_prediction']}`). This is NOT a label-inversion "
+                            "problem — toggling invert will not fix it. The model itself isn't distinguishing "
+                            "your two samples. Common causes: (1) both files went through heavy recompression "
+                            "(e.g. WhatsApp/Messenger re-encode images and strip quality, which introduces "
+                            "compression artifacts the model may mistake for manipulation) — try a real photo "
+                            "straight from a camera/camera roll, not one forwarded through a messaging app; "
+                            "(2) the model just performs poorly on this type of image/face; (3) the fallback "
+                            "model silently loaded instead of the primary one — check the model id shown above."
+                        )
                     else:
                         st.error(
-                            "⚠️ Inconclusive — the model didn't cleanly separate your two calibration "
-                            "images (e.g. it returned the same label for both, or an unmapped label). "
-                            "Try clearer, unambiguous calibration samples rather than toggling inversion blindly."
+                            "⚠️ Inconclusive — the model returned an unmapped/UNKNOWN label for at least one "
+                            "sample. Try clearer, unambiguous calibration images."
                         )
 
     uploaded_file = None
