@@ -61,6 +61,22 @@ class Config:
     IMAGE_MODEL_ID = "prithivMLmods/Deep-Fake-Detector-v2-Model"
     IMAGE_MODEL_FALLBACK = "Wvolf/ViT_Deepfake_Detection"
 
+    # KNOWN UPSTREAM BUG: prithivMLmods/Deep-Fake-Detector-v2-Model ships with an
+    # inverted id2label mapping in its config.json — confirmed by the model author
+    # in https://huggingface.co/prithivMLmods/Deep-Fake-Detector-v2-Model/discussions/2
+    # ("It seems the mapping is inverted in the HF config; which makes results
+    # inverse of what they are supposed to be when using the HF pipeline").
+    # The fix was closed by the maintainer but never actually published to
+    # config.json, so the pipeline still returns "Realism" for deepfake images
+    # and "Deepfake" for real images. We correct for it right after inference so
+    # every downstream agent (confidence, explanation, recommendation, report)
+    # works with the TRUE label. If the upstream repo is ever fixed, flip this
+    # model's entry to False.
+    IMAGE_MODEL_LABELS_INVERTED = {
+        "prithivMLmods/Deep-Fake-Detector-v2-Model": True,
+        "Wvolf/ViT_Deepfake_Detection": False,
+    }
+
     AUDIO_MODEL_ID = "MelodyMachine/Deepfake-audio-detection-V2"
     AUDIO_MODEL_FALLBACK = "mo-thecreator/Deepfake-audio-detection"
 
@@ -92,6 +108,11 @@ class Config:
 
 os.makedirs(Config.REPORT_DIR, exist_ok=True)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Which image model actually ended up loaded (set by load_image_model()).
+# image_detection_agent() reads this to know whether to apply the label-inversion
+# correction for the model that is currently active.
+_ACTIVE_IMAGE_MODEL_ID: Optional[str] = None
 
 # =========================================================
 # UTILITY FUNCTIONS
@@ -183,6 +204,28 @@ def normalize_label(label: str) -> str:
         return "REAL"
 
     return "UNKNOWN"
+
+
+def correct_inverted_labels(results, model_id: Optional[str]):
+    """Flip REAL<->DEEPFAKE labels for models known to ship inverted id2label maps.
+
+    See Config.IMAGE_MODEL_LABELS_INVERTED for why this exists. Only the
+    semantic REAL/DEEPFAKE meaning is flipped — the raw label text and score
+    are otherwise left untouched so debugging/logging still shows what the
+    model literally returned.
+    """
+    if not model_id or not Config.IMAGE_MODEL_LABELS_INVERTED.get(model_id, False):
+        return results
+
+    flip = {"REAL": "DEEPFAKE", "DEEPFAKE": "REAL"}
+    corrected = []
+    for item in results:
+        semantic = normalize_label(item.get("label", ""))
+        new_item = dict(item)
+        if semantic in flip:
+            new_item["label"] = flip[semantic]
+        corrected.append(new_item)
+    return corrected
 
 
 def _prepare_image_for_model(img: Image.Image) -> Image.Image:
@@ -336,11 +379,13 @@ class DeepfakeState(TypedDict, total=False):
 
 @st.cache_resource(show_spinner="Loading image deepfake model...")
 def load_image_model():
+    global _ACTIVE_IMAGE_MODEL_ID
     for model_id in (Config.IMAGE_MODEL_ID, Config.IMAGE_MODEL_FALLBACK):
         try:
             print(f"[model] loading image model: {model_id}")
             clf = pipeline("image-classification", model=model_id, device=0 if DEVICE == "cuda" else -1)
             print(f"[model] loaded: {model_id} (device={DEVICE})")
+            _ACTIVE_IMAGE_MODEL_ID = model_id
             return clf
         except Exception as e:
             print(f"[model] failed to load '{model_id}': {e}")
@@ -469,6 +514,12 @@ def image_detection_agent(state: DeepfakeState) -> DeepfakeState:
             results = clf(model_img)
 
         # ---------------------------------------------------------
+        # Correct for models with a known-inverted label mapping
+        # (see Config.IMAGE_MODEL_LABELS_INVERTED)
+        # ---------------------------------------------------------
+        results = correct_inverted_labels(results, _ACTIVE_IMAGE_MODEL_ID)
+
+        # ---------------------------------------------------------
         # Sort results by confidence
         # ---------------------------------------------------------
         results = sorted(
@@ -481,7 +532,8 @@ def image_detection_agent(state: DeepfakeState) -> DeepfakeState:
         # DEBUG: print the actual model output
         # ---------------------------------------------------------
         print("\n" + "=" * 50)
-        print("RAW IMAGE MODEL OUTPUT")
+        print(f"RAW IMAGE MODEL OUTPUT (model={_ACTIVE_IMAGE_MODEL_ID}, "
+              f"inversion_corrected={Config.IMAGE_MODEL_LABELS_INVERTED.get(_ACTIVE_IMAGE_MODEL_ID, False)})")
         print("=" * 50)
 
         for result in results:
@@ -493,7 +545,7 @@ def image_detection_agent(state: DeepfakeState) -> DeepfakeState:
         print("=" * 50 + "\n")
 
         # ---------------------------------------------------------
-        # Store original model scores
+        # Store original (post-correction) model scores
         # ---------------------------------------------------------
         raw_scores = {
             str(result["label"]): float(result["score"])
