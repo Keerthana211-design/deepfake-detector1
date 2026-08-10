@@ -61,21 +61,17 @@ class Config:
     IMAGE_MODEL_ID = "prithivMLmods/Deep-Fake-Detector-v2-Model"
     IMAGE_MODEL_FALLBACK = "Wvolf/ViT_Deepfake_Detection"
 
-    # KNOWN UPSTREAM BUG: prithivMLmods/Deep-Fake-Detector-v2-Model ships with an
-    # inverted id2label mapping in its config.json — confirmed by the model author
-    # in https://huggingface.co/prithivMLmods/Deep-Fake-Detector-v2-Model/discussions/2
-    # ("It seems the mapping is inverted in the HF config; which makes results
-    # inverse of what they are supposed to be when using the HF pipeline").
-    # The fix was closed by the maintainer but never actually published to
-    # config.json, so the pipeline still returns "Realism" for deepfake images
-    # and "Deepfake" for real images. We correct for it right after inference so
-    # every downstream agent (confidence, explanation, recommendation, report)
-    # works with the TRUE label. If the upstream repo is ever fixed, flip this
-    # model's entry to False.
-    IMAGE_MODEL_LABELS_INVERTED = {
-        "prithivMLmods/Deep-Fake-Detector-v2-Model": True,
-        "Wvolf/ViT_Deepfake_Detection": False,
-    }
+    # There have been user reports of prithivMLmods/Deep-Fake-Detector-v2-Model
+    # shipping an inverted id2label mapping, but this cannot be verified from
+    # here (no network access to huggingface.co in this environment) and a
+    # blind guess at the direction has already proven WRONG in practice (it
+    # made deepfakes show up as REAL). Do NOT hardcode a flip based on
+    # unverified forum reports again. Instead this is now a runtime-toggleable,
+    # per-model-id setting that defaults to "not inverted" (trust the pipeline's
+    # raw label) and is only flipped if the sidebar calibration check (see
+    # `calibrate_image_label_orientation` and the "Detect" page's calibration
+    # expander) empirically proves the model is backwards for THIS deployment.
+    IMAGE_MODEL_LABELS_INVERTED_DEFAULT = False
 
     AUDIO_MODEL_ID = "MelodyMachine/Deepfake-audio-detection-V2"
     AUDIO_MODEL_FALLBACK = "mo-thecreator/Deepfake-audio-detection"
@@ -206,15 +202,17 @@ def normalize_label(label: str) -> str:
     return "UNKNOWN"
 
 
-def correct_inverted_labels(results, model_id: Optional[str]):
-    """Flip REAL<->DEEPFAKE labels for models known to ship inverted id2label maps.
+def correct_inverted_labels(results, invert: bool):
+    """Optionally flip REAL<->DEEPFAKE labels.
 
-    See Config.IMAGE_MODEL_LABELS_INVERTED for why this exists. Only the
-    semantic REAL/DEEPFAKE meaning is flipped — the raw label text and score
-    are otherwise left untouched so debugging/logging still shows what the
-    model literally returned.
+    `invert` should come from a value the user has empirically confirmed via
+    the calibration check in the Detect page (or manually via the sidebar
+    toggle) — never hardcoded from an unverified source. Only the semantic
+    REAL/DEEPFAKE meaning is flipped — the raw label text is otherwise left
+    untouched so debugging/logging still shows exactly what the model
+    literally returned before correction.
     """
-    if not model_id or not Config.IMAGE_MODEL_LABELS_INVERTED.get(model_id, False):
+    if not invert:
         return results
 
     flip = {"REAL": "DEEPFAKE", "DEEPFAKE": "REAL"}
@@ -359,6 +357,7 @@ class DeepfakeState(TypedDict, total=False):
     media_type: Literal["image", "audio", "unknown"]
     prediction: Literal["REAL", "DEEPFAKE", "UNKNOWN"]
     raw_scores: Dict[str, float]
+    raw_model_labels_uncorrected: Dict[str, float]
     real_probability: float
     deepfake_probability: float
     decision_margin: float
@@ -514,10 +513,24 @@ def image_detection_agent(state: DeepfakeState) -> DeepfakeState:
             results = clf(model_img)
 
         # ---------------------------------------------------------
-        # Correct for models with a known-inverted label mapping
-        # (see Config.IMAGE_MODEL_LABELS_INVERTED)
+        # Store the raw, uncorrected labels BEFORE any inversion so the
+        # calibration check / debug view can show exactly what the model
+        # literally returned, independent of the invert toggle below.
         # ---------------------------------------------------------
-        results = correct_inverted_labels(results, _ACTIVE_IMAGE_MODEL_ID)
+        state["raw_model_labels_uncorrected"] = {
+            str(r.get("label")): float(r.get("score", 0.0)) for r in results
+        }
+
+        # ---------------------------------------------------------
+        # Apply the invert-labels toggle if the user has enabled it
+        # (set empirically via calibration, see calibrate_image_label_orientation
+        # and the sidebar/Detect-page toggle — never hardcoded).
+        # ---------------------------------------------------------
+        try:
+            invert_labels = bool(st.session_state.get("invert_image_labels", Config.IMAGE_MODEL_LABELS_INVERTED_DEFAULT))
+        except Exception:
+            invert_labels = Config.IMAGE_MODEL_LABELS_INVERTED_DEFAULT
+        results = correct_inverted_labels(results, invert_labels)
 
         # ---------------------------------------------------------
         # Sort results by confidence
@@ -533,7 +546,7 @@ def image_detection_agent(state: DeepfakeState) -> DeepfakeState:
         # ---------------------------------------------------------
         print("\n" + "=" * 50)
         print(f"RAW IMAGE MODEL OUTPUT (model={_ACTIVE_IMAGE_MODEL_ID}, "
-              f"inversion_corrected={Config.IMAGE_MODEL_LABELS_INVERTED.get(_ACTIVE_IMAGE_MODEL_ID, False)})")
+              f"inversion_corrected={invert_labels})")
         print("=" * 50)
 
         for result in results:
@@ -898,6 +911,53 @@ def run_pipeline(filepath: str) -> DeepfakeState:
     return workflow.invoke(initial_state)
 
 
+def calibrate_image_label_orientation(real_sample_filepath: str, fake_sample_filepath: str) -> Dict[str, Any]:
+    """Run one known-REAL and one known-DEEPFAKE image through the model with NO
+    inversion applied, and report whether the raw pipeline output matches or is
+    backwards. This is the only reliable way to know the correct orientation for
+    a given model/environment — do not hardcode it.
+
+    Returns a dict with per-sample raw predictions and a `recommended_invert`
+    bool the caller can use to set st.session_state.invert_image_labels.
+    """
+    clf = load_image_model()
+    if clf is None:
+        return {"ok": False, "reason": "Image model failed to load."}
+
+    def _raw_top_label(filepath: str) -> Optional[str]:
+        img = safe_load_image(filepath)
+        if img is None:
+            return None
+        model_img = _prepare_image_for_model(img)
+        try:
+            results = clf(model_img, top_k=None)
+        except TypeError:
+            results = clf(model_img)
+        results = sorted(results, key=lambda x: float(x.get("score", 0.0)), reverse=True)
+        return normalize_label(results[0].get("label", "")) if results else None
+
+    real_pred = _raw_top_label(real_sample_filepath)
+    fake_pred = _raw_top_label(fake_sample_filepath)
+
+    if real_pred is None or fake_pred is None:
+        return {"ok": False, "reason": "Could not decode one or both calibration images."}
+
+    # Correctly-oriented model: real sample -> REAL, fake sample -> DEEPFAKE.
+    correct_as_is = (real_pred == "REAL") and (fake_pred == "DEEPFAKE")
+    # Backwards model: real sample -> DEEPFAKE, fake sample -> REAL.
+    backwards = (real_pred == "DEEPFAKE") and (fake_pred == "REAL")
+
+    return {
+        "ok": True,
+        "real_sample_raw_prediction": real_pred,
+        "fake_sample_raw_prediction": fake_pred,
+        "correct_as_is": correct_as_is,
+        "backwards": backwards,
+        "recommended_invert": bool(backwards),
+        "ambiguous": not correct_as_is and not backwards,
+    }
+
+
 def save_uploaded_file(uploaded_file) -> str:
     """Persist a Streamlit UploadedFile to a real path on disk for the pipeline to read."""
     ext = os.path.splitext(uploaded_file.name)[1]
@@ -1016,6 +1076,22 @@ with st.sidebar:
     )
     if key_input:
         os.environ["GROQ_API_KEY"] = key_input
+
+    st.markdown("<hr style='border:0; height:1px; background:rgba(255,255,255,0.08); margin:20px 0;'>", unsafe_allow_html=True)
+
+    st.markdown("### 🔁 Image Label Orientation")
+    if "invert_image_labels" not in st.session_state:
+        st.session_state.invert_image_labels = Config.IMAGE_MODEL_LABELS_INVERTED_DEFAULT
+    st.session_state.invert_image_labels = st.checkbox(
+        "Invert REAL/DEEPFAKE for image model",
+        value=st.session_state.invert_image_labels,
+        help=(
+            "Only enable this if you've confirmed via the calibration check on the "
+            "Detect page (or by testing known real/fake images) that the model's "
+            "raw output is backwards for this deployment. Don't guess — verify first."
+        ),
+    )
+    st.caption("⚠️ Don't toggle this blindly. Use the calibration check on the Detect page with a known-real and known-deepfake image first.")
 
     st.markdown("<hr style='border:0; height:1px; background:rgba(255,255,255,0.08); margin:20px 0;'>", unsafe_allow_html=True)
     
@@ -1149,6 +1225,44 @@ def render_detect_page():
     )
 
     media_kind = st.radio("Select Target Media Format:", ["Image", "Audio"], horizontal=True)
+
+    if media_kind == "Image":
+        with st.expander("🧪 Calibrate image label orientation (recommended before trusting results)"):
+            st.caption(
+                "Upload ONE image you know is REAL and ONE image you know is a DEEPFAKE. "
+                "This runs both through the model with no inversion applied and tells you "
+                "whether the raw output is correct or backwards for this deployment — "
+                "instead of guessing."
+            )
+            cal_c1, cal_c2 = st.columns(2)
+            with cal_c1:
+                cal_real_file = st.file_uploader("Known REAL image", type=["jpg", "jpeg", "png", "bmp", "webp"], key="cal_real_uploader")
+            with cal_c2:
+                cal_fake_file = st.file_uploader("Known DEEPFAKE image", type=["jpg", "jpeg", "png", "bmp", "webp"], key="cal_fake_uploader")
+
+            if st.button("Run calibration check", key="run_calibration_btn", disabled=(cal_real_file is None or cal_fake_file is None)):
+                real_path = save_uploaded_file(cal_real_file)
+                fake_path = save_uploaded_file(cal_fake_file)
+                cal_result = calibrate_image_label_orientation(real_path, fake_path)
+
+                if not cal_result.get("ok"):
+                    st.error(f"Calibration failed: {cal_result.get('reason')}")
+                else:
+                    st.write(f"Known-REAL sample → model's raw prediction: **{cal_result['real_sample_raw_prediction']}**")
+                    st.write(f"Known-DEEPFAKE sample → model's raw prediction: **{cal_result['fake_sample_raw_prediction']}**")
+
+                    if cal_result["correct_as_is"]:
+                        st.success("✅ Model output is correctly oriented. Leave the sidebar 'Invert' toggle OFF.")
+                        st.session_state.invert_image_labels = False
+                    elif cal_result["backwards"]:
+                        st.warning("🔁 Model output is backwards for this deployment. Enabling the invert toggle automatically.")
+                        st.session_state.invert_image_labels = True
+                    else:
+                        st.error(
+                            "⚠️ Inconclusive — the model didn't cleanly separate your two calibration "
+                            "images (e.g. it returned the same label for both, or an unmapped label). "
+                            "Try clearer, unambiguous calibration samples rather than toggling inversion blindly."
+                        )
 
     uploaded_file = None
     col_up, col_prev = st.columns([1.2, 0.8])
@@ -1308,6 +1422,12 @@ def render_detect_page():
 
             # Raw Scores Expander
             with st.expander("🔬 View Raw Model Tensors & Scores"):
+                inv_state = st.session_state.get("invert_image_labels", Config.IMAGE_MODEL_LABELS_INVERTED_DEFAULT)
+                st.caption(f"Label inversion currently: {'ON' if inv_state else 'OFF'}")
+                if result.get("raw_model_labels_uncorrected"):
+                    st.markdown("**Model output before any correction:**")
+                    st.json(result.get("raw_model_labels_uncorrected", {}))
+                st.markdown("**Scores used for the final decision (after correction, if any):**")
                 st.json(result.get("raw_scores", {}))
 
             # Download Report Buttons
