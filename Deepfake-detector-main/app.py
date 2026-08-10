@@ -87,6 +87,8 @@ class Config:
 
     AUDIO_SAMPLE_RATE = 16000
     AUDIO_MAX_SECONDS = 10
+    # No longer applied — see _prepare_image_for_model docstring. Kept only so
+    # any external code referencing Config.IMAGE_TARGET_SIZE doesn't break.
     IMAGE_TARGET_SIZE = (224, 224)
     # Conservative decision policy. These are NOT claimed as universal thresholds;
     # they are intentionally conservative defaults until calibrated on a labeled
@@ -227,13 +229,22 @@ def correct_inverted_labels(results, invert: bool):
 
 
 def _prepare_image_for_model(img: Image.Image) -> Image.Image:
-    """Apply deterministic preprocessing before model inference."""
-    img = img.convert("RGB")
+    """Convert to RGB only — do NOT resize here.
 
-    return img.resize(
-        Config.IMAGE_TARGET_SIZE,
-        Image.Resampling.LANCZOS
-    )
+    Bug history: this used to force-resize every image to a hard 224x224
+    square with LANCZOS before handing it to the HF `pipeline()`. But the
+    pipeline's own image processor already resizes/crops/normalizes to
+    whatever the model was actually trained on. Doing our own resize first
+    meant every image was resized TWICE with two different algorithms, and
+    the aspect-ratio-distorting square resize introduced resampling
+    artifacts (aliasing, stretching, blockiness). A deepfake detector is
+    specifically trained to key on exactly those kinds of pixel-level
+    irregularities, so this was making real photos look artifact-riddled and
+    get misclassified as DEEPFAKE — independent of any label-mapping issue.
+    Let the pipeline's processor handle sizing; it matches the model's
+    training preprocessing and won't introduce this distortion.
+    """
+    return img.convert("RGB")
 def _image_quality(img: Image.Image) -> Dict[str, Any]:
     """Cheap quality checks used to avoid overconfident predictions."""
     arr = np.asarray(img.convert("RGB"))
