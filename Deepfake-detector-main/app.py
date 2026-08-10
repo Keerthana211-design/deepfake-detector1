@@ -107,11 +107,6 @@ class Config:
 os.makedirs(Config.REPORT_DIR, exist_ok=True)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Which image model actually ended up loaded (set by load_image_model()).
-# image_detection_agent() reads this to know whether to apply the label-inversion
-# correction for the model that is currently active.
-_ACTIVE_IMAGE_MODEL_ID: Optional[str] = None
-
 # =========================================================
 # UTILITY FUNCTIONS
 # =========================================================
@@ -389,17 +384,26 @@ class DeepfakeState(TypedDict, total=False):
 
 @st.cache_resource(show_spinner="Loading image deepfake model...")
 def load_image_model():
-    global _ACTIVE_IMAGE_MODEL_ID
+    """Returns (pipeline, model_id) as a single cached tuple.
+
+    Bug history: this used to set a module-level global (_ACTIVE_IMAGE_MODEL_ID)
+    as a side effect inside the function body. That works on the first (cold
+    cache) call, but st.cache_resource returns the cached object WITHOUT
+    re-running the function body on every subsequent Streamlit rerun — so the
+    global reset to None at module load time on each rerun and never got set
+    again, even though the correctly cached model was still being used. Every
+    caller now gets the model id back as part of the cached return value
+    itself, so it's correct on every call regardless of cache hit/miss.
+    """
     for model_id in (Config.IMAGE_MODEL_ID, Config.IMAGE_MODEL_FALLBACK):
         try:
             print(f"[model] loading image model: {model_id}")
             clf = pipeline("image-classification", model=model_id, device=0 if DEVICE == "cuda" else -1)
             print(f"[model] loaded: {model_id} (device={DEVICE})")
-            _ACTIVE_IMAGE_MODEL_ID = model_id
-            return clf
+            return clf, model_id
         except Exception as e:
             print(f"[model] failed to load '{model_id}': {e}")
-    return None
+    return None, None
 
 
 @st.cache_resource(show_spinner="Loading audio deepfake model...")
@@ -499,7 +503,7 @@ def image_detection_agent(state: DeepfakeState) -> DeepfakeState:
         # ---------------------------------------------------------
         # Load model
         # ---------------------------------------------------------
-        clf = load_image_model()
+        clf, active_model_id = load_image_model()
 
         if clf is None:
             state["error"] = (
@@ -556,7 +560,7 @@ def image_detection_agent(state: DeepfakeState) -> DeepfakeState:
         # DEBUG: print the actual model output
         # ---------------------------------------------------------
         print("\n" + "=" * 50)
-        print(f"RAW IMAGE MODEL OUTPUT (model={_ACTIVE_IMAGE_MODEL_ID}, "
+        print(f"RAW IMAGE MODEL OUTPUT (model={active_model_id}, "
               f"inversion_corrected={invert_labels})")
         print("=" * 50)
 
@@ -939,7 +943,7 @@ def calibrate_image_label_orientation(real_sample_filepath: str, fake_sample_fil
     `recommended_invert` bool the caller can use to set
     st.session_state.invert_image_labels.
     """
-    clf = load_image_model()
+    clf, active_model_id = load_image_model()
     if clf is None:
         return {"ok": False, "reason": "Image model failed to load."}
 
@@ -980,7 +984,7 @@ def calibrate_image_label_orientation(real_sample_filepath: str, fake_sample_fil
 
     return {
         "ok": True,
-        "active_model_id": _ACTIVE_IMAGE_MODEL_ID,
+        "active_model_id": active_model_id,
         "real_sample_raw_prediction": real_pred,
         "real_sample_confidence": real_info["top_score"],
         "real_sample_all_scores": real_info["all_scores"],
